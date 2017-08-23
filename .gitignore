@@ -1,2 +1,5 @@
 PFGP
 data
+*.csv
+*.pvd
+*.vti

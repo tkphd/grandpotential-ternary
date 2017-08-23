@@ -8,6 +8,9 @@ typedef MMSP::grid<3,MMSP::vector<double> > GRID3D;
 template<typename T>
 void computeCompositions(MMSP::vector<T>& v);
 
+template<int dim, typename T>
+T computeEnergy(MMSP::grid<dim,MMSP::vector<T> >& GRID);
+
 template <typename T> T g(const T& x) {return x * x * x * (6. * x * x - 15. * x + 10.);}
 template <typename T> T gprime(const T& x) {return 30. * x * x * (x - 1.) * (x - 1.);}
 

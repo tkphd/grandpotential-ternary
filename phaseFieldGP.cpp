@@ -15,8 +15,7 @@
  *                                                                                   *
  * This software can be redistributed and/or modified freely provided that any       *
  * derivative works bear some notice that they are derived from it, and any modified *
- * versions bear some notice that they have been modified. Derivative works that     *
- * include MMSP or other software licensed under the GPL may be subject to the GPL.  *
+ * versions bear some notice that they have been modified.                           *
  *************************************************************************************/
 
 #include <cmath>
@@ -51,13 +50,13 @@ const double x0_Cr = 0.45;
 const double x0_Nb = 0.07;
 
 // diffusion constants
-const double D_CrCr = 2.16E-15;
-const double D_CrNb = 0.56E-15;
-const double D_NbCr = 2.96E-15;
-const double D_NbNb = 4.29E-15;
+const double D_CrCr = 2.16e-15;
+const double D_CrNb = 0.56e-15;
+const double D_NbCr = 2.96e-15;
+const double D_NbNb = 4.29e-15;
 
-const double D_Cr[2] = {D_CrCr, D_CrNb};
-const double D_Nb[2] = {D_NbCr, D_NbNb};
+const double D_Cr[2] = {D_CrCr, D_CrNb}; // first column of diffusivity matrix
+const double D_Nb[2] = {D_NbCr, D_NbNb}; // second column
 
 // paraboloid curvatures (from CALPHAD)
 const double gam_A_CrCr =   4948774782.83651;
@@ -115,8 +114,8 @@ void generate(int dim, const char* filename)
 		double Ntot = 1.0;
 
 		// construct grid
-		const int N = 12;
-		GRID2D initGrid(N, -Nx/2, Nx/2, -Ny/2, Ny/2);
+		const int Nfields = 12;
+		GRID2D initGrid(Nfields, -Nx/2, Nx/2, -Ny/2, Ny/2);
 
 		// boundary conditions
 		for (int d = 0; d < dim; d++) {
@@ -131,11 +130,11 @@ void generate(int dim, const char* filename)
 
 		// initial conditions
 		const int R = 20; // seed radius, in mesh points
-		const int D = 16 + Nx/4; // seed separation, in mesh points
+		const int D = 18 + Nx/2; // seed separation, in mesh points
 		const double Np = 2.0 * M_PI * R * R; // total area of precipitates
 		const double Nt = Nx * Ny; // total system size
-		const double xCr0 = (x0_Cr*Nt - (xe_Cr_del + xe_Cr_lav)*Np)/(Nt - Np);
-		const double xNb0 = (x0_Nb*Nt - (xe_Nb_del + xe_Nb_lav)*Np)/(Nt - Np);
+		const double xCr0 = (x0_Cr * Nt - (xe_Cr_del + xe_Cr_lav) * Np) / (Nt - Np);
+		const double xNb0 = (x0_Nb * Nt - (xe_Nb_del + xe_Nb_lav) * Np) / (Nt - Np);
 
 		// initial deviation from equilibrium compositions:
 		const double dc_Cr_gam = xCr0 - xe_Cr_gam;
@@ -157,13 +156,19 @@ void generate(int dim, const char* filename)
 		const double u_Cr_lav = lav_A_CrCr * dc_Cr_lav + lav_A_CrNb * dc_Nb_lav;
 		const double u_Nb_lav = lav_A_CrNb * dc_Cr_lav + lav_A_NbNb * dc_Nb_lav;
 
-		const vector<double> blank(N, 0.);
+		const vector<double> blank(Nfields, 0.);
 
+		double energy = 0.;
+		FILE* efile;
+		if (rank==0)
+			efile = fopen("energy.csv", "w");
+
+		#pragma omp parallel for
 		for (int n = 0; n < nodes(initGrid); n++) {
 			vector<int> x = position(initGrid, n);
 			initGrid(n) = blank;
 
-			int r = ceil(sqrt((x[0] - D)*(x[0] - D) + x[1]*x[1]));
+			int r = sqrt((abs(x[0]) - D/2) * (abs(x[0]) - D/2) + x[1] * x[1]);
 
 			if (r < R) { // point lies within a precipitate
 				if (x[0] < 0) { // delta precipitate
@@ -185,8 +190,46 @@ void generate(int dim, const char* filename)
 			computeCompositions(initGrid(n));
 		}
 
+		ghostswap(initGrid);
+
+		#pragma omp parallel for
+		for (int n = 0; n < nodes(initGrid); n++) {
+			vector<int> x = position(initGrid, n);
+			const vector<double>& initGridN = initGrid(n);
+			const double& mu_Cr = initGridN[0];
+			const double& mu_Nb = initGridN[1];
+			const double& phi_del = initGridN[2];
+			const double& phi_lav = initGridN[3];
+			const double phi_gam = 1. - phi_del - phi_lav;
+
+			vector<double> grad_phi_del = gradient(initGrid, x, 2);
+			vector<double> grad_phi_lav = gradient(initGrid, x, 3);
+
+			// compute grand potentials (Eqn. 19)
+			const double w_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
+			const double w_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
+			const double w_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
+
+			double myenergy = 0.;
+			myenergy += 0.5 * kappa * grad_phi_del * grad_phi_del + omega * fdw(phi_del) + alpha * phi_del*phi_del * phi_lav*phi_lav;
+			myenergy += 0.5 * kappa * grad_phi_lav * grad_phi_lav + omega * fdw(phi_lav) + alpha * phi_del*phi_del * phi_lav*phi_lav;
+			myenergy += g(phi_gam) * w_gam + g(phi_del) * w_del + g(phi_lav) * w_lav;
+
+			myenergy *= dV;
+
+			#pragma omp atomic
+			energy += myenergy;
+		}
+
+		if (rank==0) {
+			fprintf(efile, "time,energy\n");
+			fprintf(efile, "0,%f\n", energy);
+			fclose(efile);
+		}
+
 		// write intial checkpoint to disk
 		output(initGrid,filename);
+
 	} else {
 		if (rank==0)
 			std::cerr << "ERROR: " << dim << "-D grids are not implemented." << std::endl;
@@ -201,13 +244,25 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 	rank = MPI::COMM_WORLD.Get_rank();
 	#endif
 
+	double dV = 1.;
+	for (int d=0; d<dim; d++)
+		dV *= dx(oldGrid, d);
+
+	ghostswap(oldGrid);
+
 	grid<dim,vector<T> > newGrid(oldGrid);
+
+	static double elapsed = 0.;
+
+	FILE* efile;
+	if (rank==0)
+		efile = fopen("energy.csv", "a");
 
 	for (int step = 0; step < steps; step++) {
 		if (rank == 0)
 			print_progress(step, steps);
 
-		ghostswap(oldGrid);
+		double energy = 0.;
 
 		#pragma omp parallel for
 		for (int n = 0; n < nodes(oldGrid); n++) {
@@ -236,9 +291,6 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			const T w_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
 			const T w_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
 
-			// compute sum of phi_precip squared
-			const T sumPhiSq = oldGridN[2]*oldGridN[2] + oldGridN[3]*oldGridN[3];
-
 			// compute sources of chemical potential
 			const vector<T> lap_phi = ranged_laplacian(oldGrid, x, 2, 4);
 			const vector<T> lap_Cr = divGradCr(oldGrid, x, 2);
@@ -252,12 +304,12 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			// phi equation of motion
 			const T dphidt_del = Lmob * ( kappa * lap_phi[0]
 			                            - omega * fprime(phi_del)
-			                            - 2. * alpha * (sumPhiSq - phi_del * phi_del)
+			                            - 2. * alpha * phi_del * phi_lav * phi_lav
 			                            - (w_del - w_gam) * gprime(phi_del)
 			                   );
 			const T dphidt_lav = Lmob * ( kappa * lap_phi[1]
 			                            - omega * fprime(phi_lav)
-			                            - 2. * alpha * (sumPhiSq - phi_lav * phi_lav)
+			                            - 2. * alpha * phi_lav * phi_del * phi_del
 			                            - (w_lav - w_gam) * gprime(phi_lav)
 			                   );
 
@@ -265,8 +317,8 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			newGrid(n)[3] = phi_lav + dt * dphidt_lav;
 
 			// mu equation of motion
-			const T dudt_A = lap_Cr[0] + lap_Cr[1] - (gprime(phi_del)*(del_xcr-gam_xcr)*dphidt_del + gprime(phi_lav)*(lav_xcr-gam_xcr)*dphidt_lav);
-			const T dudt_B = lap_Nb[0] + lap_Nb[1] - (gprime(phi_del)*(del_xcr-gam_xcr)*dphidt_del + gprime(phi_lav)*(lav_xnb-gam_xnb)*dphidt_lav);
+			const T dudt_A = lap_Cr[0] + lap_Cr[1] - (gprime(phi_del) * (del_xcr - gam_xcr) * dphidt_del - gprime(phi_lav) * (lav_xcr - gam_xcr) * dphidt_lav);
+			const T dudt_B = lap_Nb[0] + lap_Nb[1] - (gprime(phi_del) * (del_xnb - gam_xnb) * dphidt_del - gprime(phi_lav) * (lav_xnb - gam_xnb) * dphidt_lav);
 			const T dudt_Cr = inv_X_CrCr * dudt_A + inv_X_CrNb * dudt_B;
 			const T dudt_Nb = inv_X_CrNb * dudt_A + inv_X_NbNb * dudt_B;
 
@@ -276,8 +328,46 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			computeCompositions(newGrid(n));
 		}
 
+		elapsed += dt;
 		swap(oldGrid, newGrid);
-	}
+		ghostswap(oldGrid);
+
+		#pragma omp parallel for
+		for (int n = 0; n < nodes(oldGrid); n++) {
+			vector<int> x = position(oldGrid, n);
+			const vector<T>& oldGridN = oldGrid(n);
+			const T& mu_Cr = oldGridN[0];
+			const T& mu_Nb = oldGridN[1];
+			const T& phi_del = oldGridN[2];
+			const T& phi_lav = oldGridN[3];
+			const T phi_gam = 1. - phi_del - phi_lav;
+
+			vector<T> grad_phi_del = gradient(oldGrid, x, 2);
+			vector<T> grad_phi_lav = gradient(oldGrid, x, 3);
+
+			// compute grand potentials (Eqn. 19)
+			const T w_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
+			const T w_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
+			const T w_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
+
+			double myenergy = 0.;
+			myenergy += 0.5 * kappa * grad_phi_del * grad_phi_del + omega * fdw(phi_del) + alpha * phi_del*phi_del * phi_lav*phi_lav;
+			myenergy += 0.5 * kappa * grad_phi_lav * grad_phi_lav + omega * fdw(phi_lav) + alpha * phi_del*phi_del * phi_lav*phi_lav;
+			myenergy += g(phi_gam) * w_gam + g(phi_del) * w_del + g(phi_lav) * w_lav;
+
+			myenergy *= dV;
+
+			#pragma omp atomic
+			energy += myenergy;
+		}
+
+		if (rank==0)
+			fprintf(efile, "%f,%f\n", elapsed, energy);
+
+	} // for step in steps
+
+	if (rank==0)
+		fclose(efile);
 }
 
 } // namespace MMSP
@@ -315,9 +405,9 @@ void computeCompositions(MMSP::vector<T>& v)
 template <int dim, typename T> MMSP::vector<T> ranged_laplacian(const MMSP::grid<dim,MMSP::vector<T> >& GRID, const MMSP::vector<int>& x, int start, int end)
 {
 	MMSP::vector<T> laplacian(end-start, 0.);
+	const MMSP::vector<T>& yc = GRID(x);
 
 	for (int d=0; d<dim; d++) {
-		const MMSP::vector<T>& yc = GRID(x);
 		MMSP::vector<int> s(x);
 		s[d] -= 1;
 		const MMSP::vector<T>& yl = GRID(s);
@@ -325,7 +415,8 @@ template <int dim, typename T> MMSP::vector<T> ranged_laplacian(const MMSP::grid
 		const MMSP::vector<T>& yh = GRID(s);
 		s[d] -= 1;
 
-		const T weight = 1.0 /(dx(GRID, d) * dx(GRID, d));
+		const T weight = 1.0 / (dx(GRID, d) * dx(GRID, d));
+
 		for (int i = start; i<end; i++)
 			laplacian[i-start] += weight * (yh[i] - 2. * yc[i] + yl[i]);
 	}
@@ -336,8 +427,8 @@ template <int dim, typename T> MMSP::vector<T> ranged_laplacian(const MMSP::grid
 template <int dim, typename T> MMSP::vector<T> divGradCr(const MMSP::grid<dim,MMSP::vector<T> >& GRID, const MMSP::vector<int>& x, int N)
 {
 	MMSP::vector<T> laplacian(N, 0.);
-	T Ml, Mc, Mh; // mobilities
 	const MMSP::vector<T>& yc = GRID(x);
+	T Ml, Mc, Mh; // mobilities
 
 	for (int d=0; d<dim; d++) {
 		MMSP::vector<int> s(x);
@@ -347,13 +438,14 @@ template <int dim, typename T> MMSP::vector<T> divGradCr(const MMSP::grid<dim,MM
 		const MMSP::vector<T>& yh = GRID(s);
 		s[d] -= 1;
 
-		const T weight = 1.0 /(dx(GRID, d) * dx(GRID, d));
+		const T weight = 1.0 / (dx(GRID, d) * dx(GRID, d));
 
 		for (int i=0; i<N; i++) {
 			Mc =  D_Cr[i] * (g(yc[2]) * del_X_Cr[i] + g(yc[3]) * lav_X_Cr[i] + (1.-g(yc[2])-g(yc[3])) * gam_X_Cr[i]);
 			Ml =  D_Cr[i] * (g(yl[2]) * del_X_Cr[i] + g(yl[3]) * lav_X_Cr[i] + (1.-g(yl[2])-g(yl[3])) * gam_X_Cr[i]);
 			Mh =  D_Cr[i] * (g(yh[2]) * del_X_Cr[i] + g(yh[3]) * lav_X_Cr[i] + (1.-g(yh[2])-g(yh[3])) * gam_X_Cr[i]);
-			laplacian[i] += weight * (0.5*(Mh+Mc)*(yh[i]-yc[i]) - 0.5*(Mc+Ml)*(yc[i]-yl[i]));
+
+			laplacian[i] += weight * (0.5 * (Mh + Mc) * (yh[i] - yc[i]) - 0.5 * (Mc + Ml) * (yc[i] - yl[i]));
 		}
 	}
 
@@ -363,9 +455,8 @@ template <int dim, typename T> MMSP::vector<T> divGradCr(const MMSP::grid<dim,MM
 template <int dim, typename T> MMSP::vector<T> divGradNb(const MMSP::grid<dim,MMSP::vector<T> >& GRID, const MMSP::vector<int>& x, int N)
 {
 	MMSP::vector<T> laplacian(N, 0.);
-	T Ml, Mc, Mh; // mobilities
 	const MMSP::vector<T>& yc = GRID(x);
-
+	T Ml, Mc, Mh; // mobilities
 
 	for (int d=0; d<dim; d++) {
 		MMSP::vector<int> s(x);
@@ -375,13 +466,14 @@ template <int dim, typename T> MMSP::vector<T> divGradNb(const MMSP::grid<dim,MM
 		const MMSP::vector<T>& yh = GRID(s);
 		s[d] -= 1;
 
-		const T weight = 1.0 /(dx(GRID, d) * dx(GRID, d));
+		const T weight = 1.0 / (dx(GRID, d) * dx(GRID, d));
 
 		for (int i=0; i<N; i++) {
 			Mc =  D_Nb[i] * (g(yc[2]) * del_X_Nb[i] + g(yc[3]) * lav_X_Nb[i] + (1.-g(yc[2])-g(yc[3])) * gam_X_Nb[i]);
 			Ml =  D_Nb[i] * (g(yl[2]) * del_X_Nb[i] + g(yl[3]) * lav_X_Nb[i] + (1.-g(yl[2])-g(yl[3])) * gam_X_Nb[i]);
 			Mh =  D_Nb[i] * (g(yh[2]) * del_X_Nb[i] + g(yh[3]) * lav_X_Nb[i] + (1.-g(yh[2])-g(yh[3])) * gam_X_Nb[i]);
-			laplacian[i] += weight * (0.5*(Mh+Mc)*(yh[i]-yc[i]) - 0.5*(Mc+Ml)*(yc[i]-yl[i]));
+
+			laplacian[i] += weight * (0.5 * (Mh + Mc) * (yh[i] - yc[i]) - 0.5 * (Mc + Ml) * (yc[i] - yl[i]));
 		}
 	}
 
