@@ -1,5 +1,7 @@
-PFGP
 data
+PFGP
+parallel
+.directory
 *.csv
 *.pvd
 *.vti

@@ -3,7 +3,8 @@
  * Algorithms for 2D and 3D isotropic Cr-Nb-Ni alloy phase transformations           *
  * using grand potential formalism after Plapp. Derivation thanks to N. Ofori-Opoku  *
  *                                                                                   *
- * Questions/comments to trevor.keller@nist.gov (Trevor Keller, Ph.D.)               *
+ * Questions/comments to trevor.keller@nist.gov (Trevor Keller)                      *
+ *                    or nana.oforiopoku@nist.gov (Nana Ofori-Opoku)                 *
  *                                                                                   *
  * This software was developed at the National Institute of Standards and Technology *
  * by employees of the Federal Government in the course of their official duties.    *
@@ -33,7 +34,7 @@ const double dt = 7.5e-5;
 // phase-field parameters
 const double sigma = 1.01;
 const double kappa = 1.24e-8;
-const double omega = (3.0 * 2.2 * sigma) / (10. * meshres);
+const double W = (3.0 * 2.2 * sigma) / (10. * meshres);
 const double Lmob = 2.904e-11;
 const double alpha = 1.07e11;
 
@@ -130,7 +131,7 @@ void generate(int dim, const char* filename)
 
 		// initial conditions
 		const int R = 20; // seed radius, in mesh points
-		const int D = 18 + Nx/2; // seed separation, in mesh points
+		const int D = 6 + Nx/2; // seed separation, in mesh points
 		const double Np = 2.0 * M_PI * R * R; // total area of precipitates
 		const double Nt = Nx * Ny; // total system size
 		const double xCr0 = (x0_Cr * Nt - (xe_Cr_del + xe_Cr_lav) * Np) / (Nt - Np);
@@ -158,8 +159,7 @@ void generate(int dim, const char* filename)
 
 		const vector<double> blank(Nfields, 0.);
 
-		double energy = 0.;
-		FILE* efile;
+		FILE* efile = NULL;
 		if (rank==0)
 			efile = fopen("energy.csv", "w");
 
@@ -190,40 +190,8 @@ void generate(int dim, const char* filename)
 			computeCompositions(initGrid(n));
 		}
 
-		ghostswap(initGrid);
-
-		#pragma omp parallel for
-		for (int n = 0; n < nodes(initGrid); n++) {
-			vector<int> x = position(initGrid, n);
-			const vector<double>& initGridN = initGrid(n);
-			const double& mu_Cr = initGridN[0];
-			const double& mu_Nb = initGridN[1];
-			const double& phi_del = initGridN[2];
-			const double& phi_lav = initGridN[3];
-			const double phi_gam = 1. - phi_del - phi_lav;
-
-			vector<double> grad_phi_del = gradient(initGrid, x, 2);
-			vector<double> grad_phi_lav = gradient(initGrid, x, 3);
-
-			// compute grand potentials (Eqn. 19)
-			const double w_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
-			const double w_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
-			const double w_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
-
-			double myenergy = 0.;
-			myenergy += 0.5 * kappa * grad_phi_del * grad_phi_del + omega * fdw(phi_del) + alpha * phi_del*phi_del * phi_lav*phi_lav;
-			myenergy += 0.5 * kappa * grad_phi_lav * grad_phi_lav + omega * fdw(phi_lav) + alpha * phi_del*phi_del * phi_lav*phi_lav;
-			myenergy += g(phi_gam) * w_gam + g(phi_del) * w_del + g(phi_lav) * w_lav;
-
-			myenergy *= dV;
-
-			#pragma omp atomic
-			energy += myenergy;
-		}
-
-		if (rank==0) {
-			fprintf(efile, "time,energy\n");
-			fprintf(efile, "0,%f\n", energy);
+		if (rank==0 && efile != NULL) {
+			fprintf(efile, "time,energy,vphi\n");
 			fclose(efile);
 		}
 
@@ -254,7 +222,7 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 
 	static double elapsed = 0.;
 
-	FILE* efile;
+	FILE* efile = NULL;
 	if (rank==0)
 		efile = fopen("energy.csv", "a");
 
@@ -262,9 +230,9 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 		if (rank == 0)
 			print_progress(step, steps);
 
-		double energy = 0.;
+		double vphi_max=-1.e5;
 
-		#pragma omp parallel for
+		#pragma omp parallel for reduction(max:vphi_max)
 		for (int n = 0; n < nodes(oldGrid); n++) {
 			vector<int> x = position(oldGrid, n);
 			const vector<T>& oldGridN = oldGrid(n);
@@ -287,9 +255,9 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			const T g_gam = 1. - g_del - g_lav;
 
 			// compute grand potentials (Eqn. 19)
-			const T w_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
-			const T w_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
-			const T w_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
+			const T omega_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
+			const T omega_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
+			const T omega_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
 
 			// compute sources of chemical potential
 			const vector<T> lap_phi = ranged_laplacian(oldGrid, x, 2, 4);
@@ -301,72 +269,88 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			const T inv_X_CrNb = g_gam * gam_A_CrNb + g_del * del_A_CrNb + g_lav * lav_A_CrNb;
 			const T inv_X_NbNb = g_gam * gam_A_NbNb + g_del * del_A_NbNb + g_lav * lav_A_NbNb;
 
-			// phi equation of motion
+			// phi increment
 			const T dphidt_del = Lmob * ( kappa * lap_phi[0]
-			                            - omega * fprime(phi_del)
+			                            - W * fprime(phi_del)
 			                            - 2. * alpha * phi_del * phi_lav * phi_lav
-			                            - (w_del - w_gam) * gprime(phi_del)
+			                            - (omega_del - omega_gam) * gprime(phi_del)
 			                   );
 			const T dphidt_lav = Lmob * ( kappa * lap_phi[1]
-			                            - omega * fprime(phi_lav)
+			                            - W * fprime(phi_lav)
 			                            - 2. * alpha * phi_lav * phi_del * phi_del
-			                            - (w_lav - w_gam) * gprime(phi_lav)
+			                            - (omega_lav - omega_gam) * gprime(phi_lav)
 			                   );
 
-			newGrid(n)[2] = phi_del + dt * dphidt_del;
-			newGrid(n)[3] = phi_lav + dt * dphidt_lav;
+			const T vphi = max(dphidt_del, dphidt_lav);
 
-			// mu equation of motion
+			if (vphi > vphi_max)
+				vphi_max = vphi;
+
+			// mu increment
 			const T dudt_A = lap_Cr[0] + lap_Cr[1] - (gprime(phi_del) * (del_xcr - gam_xcr) * dphidt_del - gprime(phi_lav) * (lav_xcr - gam_xcr) * dphidt_lav);
 			const T dudt_B = lap_Nb[0] + lap_Nb[1] - (gprime(phi_del) * (del_xnb - gam_xnb) * dphidt_del - gprime(phi_lav) * (lav_xnb - gam_xnb) * dphidt_lav);
 			const T dudt_Cr = inv_X_CrCr * dudt_A + inv_X_CrNb * dudt_B;
 			const T dudt_Nb = inv_X_CrNb * dudt_A + inv_X_NbNb * dudt_B;
 
+			// equations of motion
 			newGrid(n)[0] = mu_Cr + dt * dudt_Cr;
 			newGrid(n)[1] = mu_Nb + dt * dudt_Nb;
+			newGrid(n)[2] = phi_del + dt * dphidt_del;
+			newGrid(n)[3] = phi_lav + dt * dphidt_lav;
 
 			computeCompositions(newGrid(n));
 		}
 
-		elapsed += dt;
 		swap(oldGrid, newGrid);
 		ghostswap(oldGrid);
 
-		#pragma omp parallel for
-		for (int n = 0; n < nodes(oldGrid); n++) {
-			vector<int> x = position(oldGrid, n);
-			const vector<T>& oldGridN = oldGrid(n);
-			const T& mu_Cr = oldGridN[0];
-			const T& mu_Nb = oldGridN[1];
-			const T& phi_del = oldGridN[2];
-			const T& phi_lav = oldGridN[3];
-			const T phi_gam = 1. - phi_del - phi_lav;
+		elapsed += dt;
+		double energy = 0.;
 
-			vector<T> grad_phi_del = gradient(oldGrid, x, 2);
-			vector<T> grad_phi_lav = gradient(oldGrid, x, 3);
+		if (step % 100 == 0) {
+			#pragma omp parallel for
+			for (int n = 0; n < nodes(oldGrid); n++) {
+				vector<int> x = position(oldGrid, n);
+				const vector<T>& oldGridN = oldGrid(n);
+				const vector<T>& newGridN = newGrid(n);
+				const T& mu_Cr = oldGridN[0];
+				const T& mu_Nb = oldGridN[1];
+				const T& phi_del = oldGridN[2];
+				const T& phi_lav = oldGridN[3];
+				const T phi_gam = 1. - phi_del - phi_lav;
 
-			// compute grand potentials (Eqn. 19)
-			const T w_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
-			const T w_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
-			const T w_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
+				vector<T> grad_phi_del = gradient(oldGrid, x, 2);
+				vector<T> grad_phi_lav = gradient(oldGrid, x, 3);
 
-			double myenergy = 0.;
-			myenergy += 0.5 * kappa * grad_phi_del * grad_phi_del + omega * fdw(phi_del) + alpha * phi_del*phi_del * phi_lav*phi_lav;
-			myenergy += 0.5 * kappa * grad_phi_lav * grad_phi_lav + omega * fdw(phi_lav) + alpha * phi_del*phi_del * phi_lav*phi_lav;
-			myenergy += g(phi_gam) * w_gam + g(phi_del) * w_del + g(phi_lav) * w_lav;
+				const T omega_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
+				const T omega_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
+				const T omega_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
 
-			myenergy *= dV;
+				double myenergy = 0.;
+				myenergy += 0.5 * kappa * grad_phi_del * grad_phi_del + W * fdw(phi_del) + alpha * phi_del*phi_del * phi_lav*phi_lav;
+				myenergy += 0.5 * kappa * grad_phi_lav * grad_phi_lav + W * fdw(phi_lav) + alpha * phi_del*phi_del * phi_lav*phi_lav;
+				myenergy += g(phi_gam) * omega_gam + g(phi_del) * omega_del + g(phi_lav) * omega_lav;
 
-			#pragma omp atomic
-			energy += myenergy;
+				myenergy *= dV;
+
+				#pragma omp atomic
+				energy += myenergy;
+			}
+
+			#ifdef MPI_VERSION
+			double myE(energy);
+			MPI::COMM_WORLD.Reduce(&myE, &energy, 1, MPI_DOUBLE, MPI_SUM, 0);
+			#endif
+
+			if (rank==0 && efile != NULL) {
+				fprintf(efile, "%e,%e,%e\n", elapsed, energy, vphi_max);
+				fflush(efile);
+			}
 		}
-
-		if (rank==0)
-			fprintf(efile, "%f,%f\n", elapsed, energy);
 
 	} // for step in steps
 
-	if (rank==0)
+	if (rank==0 && efile != NULL)
 		fclose(efile);
 }
 
