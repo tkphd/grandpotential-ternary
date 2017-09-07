@@ -3,5 +3,10 @@ PFGP
 parallel
 .directory
 *.csv
+*.dat
+*.gz
+*.log
+*.png
 *.pvd
+*.swp
 *.vti
