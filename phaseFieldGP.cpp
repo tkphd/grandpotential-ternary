@@ -27,6 +27,10 @@
 #include "MMSP.hpp"
 #include "phaseFieldGP.hpp"
 
+// switches
+const bool no_flux = false;
+const bool flat_ifce = true;
+
 // numerical parameters
 const double meshres = 5.0e-9;
 const double dt = 7.5e-5;
@@ -45,10 +49,6 @@ const double xe_Cr_del = 0.015;
 const double xe_Nb_del = 0.245;
 const double xe_Cr_lav = 0.300;
 const double xe_Nb_lav = 0.328;
-
-// system composition
-const double x0_Cr = 0.45;
-const double x0_Nb = 0.07;
 
 // diffusion constants
 const double D_CrCr = 2.16e-15;
@@ -109,8 +109,8 @@ void generate(int dim, const char* filename)
 
 	if (dim==2) {
 		// set mesh size and resolution
-		const int Nx = 320;
-		const int Ny = 192;
+		const int Nx = 256;
+		const int Ny = 128;
 		double dV = 1.0;
 		double Ntot = 1.0;
 
@@ -123,19 +123,64 @@ void generate(int dim, const char* filename)
 			dx(initGrid,d)=meshres;
 			dV *= meshres;
 			Ntot *= g1(initGrid, d) - g0(initGrid, d);
-			if (x0(initGrid, d) == g0(initGrid, d))
-				b0(initGrid, d) = Neumann;
-			if (x1(initGrid, d) == g1(initGrid, d))
-				b1(initGrid, d) = Neumann;
+			if (no_flux) {
+				if (x0(initGrid, d) == g0(initGrid, d))
+					b0(initGrid, d) = Neumann;
+				if (x1(initGrid, d) == g1(initGrid, d))
+					b1(initGrid, d) = Neumann;
+			}
 		}
 
-		// initial conditions
-		const int R = 20; // seed radius, in mesh points
-		const int D = 6 + Nx/2; // seed separation, in mesh points
-		const double Np = 2.0 * M_PI * R * R; // total area of precipitates
+		// initial matrix composition
+		double xCr0 = xe_Cr_gam;
+		double xNb0 = xe_Nb_gam;
 		const double Nt = Nx * Ny; // total system size
-		const double xCr0 = (x0_Cr * Nt - (xe_Cr_del + xe_Cr_lav) * Np) / (Nt - Np);
-		const double xNb0 = (x0_Nb * Nt - (xe_Nb_del + xe_Nb_lav) * Np) / (Nt - Np);
+
+		const vector<double> blank(Nfields, 0.);
+
+		if (flat_ifce) { // flat interfaces
+			const int R = 40; // slab width, in mesh points
+			xCr0 = xe_Cr_gam; // just making sure
+			xNb0 = xe_Nb_gam;
+
+			#pragma omp parallel for
+			for (int n = 0; n < nodes(initGrid); n++) {
+				vector<int> x = position(initGrid, n);
+				initGrid(n) = blank;
+
+				if (x[0] > g0(initGrid,0)/2 - R/2 &&
+				    x[0] < g0(initGrid,0)/2 + R/2)
+					initGrid(n)[2] = 1.0;
+				else if (x[0] > g1(initGrid,0)/2 - R/2 &&
+				         x[0] < g1(initGrid,0)/2 + R/2)
+					initGrid(n)[3] = 1.0;
+			}
+		} else { // curved interfaces
+			// system composition
+			const double x0_Cr = 0.45;
+			const double x0_Nb = 0.07;
+			const int R = 20; // seed radius, in mesh points
+			const int D = 6 + Nx/2; // seed separation, in mesh points
+			const double Np = 2.0 * M_PI * R * R; // total area of precipitates
+			xCr0 = (x0_Cr * Nt - 0.5 * (xe_Cr_del + xe_Cr_lav) * Np) / (Nt - Np);
+			xNb0 = (x0_Nb * Nt - 0.5 * (xe_Nb_del + xe_Nb_lav) * Np) / (Nt - Np);
+
+			#pragma omp parallel for
+			for (int n = 0; n < nodes(initGrid); n++) {
+				vector<int> x = position(initGrid, n);
+				initGrid(n) = blank;
+
+				int r = sqrt((abs(x[0]) - D/2) * (abs(x[0]) - D/2) + x[1] * x[1]);
+
+				if (r < R) { // point lies within a precipitate
+					if (x[0] < 0) { // delta precipitate
+						initGrid(n)[2] = 1.0;
+					} else { // Laves precipitate
+						initGrid(n)[3] = 1.0;
+					}
+				}
+			}
+		}
 
 		// initial deviation from equilibrium compositions:
 		const double dc_Cr_gam = xCr0 - xe_Cr_gam;
@@ -157,41 +202,28 @@ void generate(int dim, const char* filename)
 		const double u_Cr_lav = lav_A_CrCr * dc_Cr_lav + lav_A_CrNb * dc_Nb_lav;
 		const double u_Nb_lav = lav_A_CrNb * dc_Cr_lav + lav_A_NbNb * dc_Nb_lav;
 
-		const vector<double> blank(Nfields, 0.);
+		#pragma omp parallel for
+		for (int n = 0; n < nodes(initGrid); n++) {
+			vector<double>& initGridN = initGrid(n);
+
+			const double& phi_del = initGridN[2];
+			const double& phi_lav = initGridN[3];
+			const double phi_gam = 1. - phi_del - phi_lav;
+
+			// set chemical potentials
+			initGridN[0] = u_Cr_del * phi_del + u_Cr_lav * phi_lav + u_Cr_gam * phi_gam;
+			initGridN[1] = u_Nb_del * phi_del + u_Nb_lav * phi_lav + u_Nb_gam * phi_gam;
+
+			// set compositions
+			computeCompositions(initGridN);
+		}
 
 		FILE* efile = NULL;
 		if (rank==0)
 			efile = fopen("energy.csv", "w");
 
-		#pragma omp parallel for
-		for (int n = 0; n < nodes(initGrid); n++) {
-			vector<int> x = position(initGrid, n);
-			initGrid(n) = blank;
-
-			int r = sqrt((abs(x[0]) - D/2) * (abs(x[0]) - D/2) + x[1] * x[1]);
-
-			if (r < R) { // point lies within a precipitate
-				if (x[0] < 0) { // delta precipitate
-					initGrid(n)[2] = 1.0;
-				} else { // Laves precipitate
-					initGrid(n)[3] = 1.0;
-				}
-			}
-
-			const double phi_del = initGrid(n)[2];
-			const double phi_lav = initGrid(n)[3];
-			const double phi_gam = 1. - phi_del - phi_lav;
-
-			// set chemical potentials
-			initGrid(n)[0] = u_Cr_del * phi_del + u_Cr_lav * phi_lav + u_Cr_gam * phi_gam;
-			initGrid(n)[1] = u_Nb_del * phi_del + u_Nb_lav * phi_lav + u_Nb_gam * phi_gam;
-
-			// set compositions
-			computeCompositions(initGrid(n));
-		}
-
 		if (rank==0 && efile != NULL) {
-			fprintf(efile, "time,energy,vphi\n");
+			fprintf(efile, "time,xCr,xNb,energy,vphi\n");
 			fclose(efile);
 		}
 
@@ -213,8 +245,11 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 	#endif
 
 	double dV = 1.;
-	for (int d=0; d<dim; d++)
+	double Nt = 1.;
+	for (int d=0; d<dim; d++) {
 		dV *= dx(oldGrid, d);
+		Nt *= g1(oldGrid, d) - g0(oldGrid, d);
+	}
 
 	ghostswap(oldGrid);
 
@@ -230,7 +265,7 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 		if (rank == 0)
 			print_progress(step, steps);
 
-		double vphi_max=-1.e5;
+		double vphi_max = -1.e5;
 
 		#pragma omp parallel for reduction(max:vphi_max)
 		for (int n = 0; n < nodes(oldGrid); n++) {
@@ -255,9 +290,23 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			const T g_gam = 1. - g_del - g_lav;
 
 			// compute grand potentials (Eqn. 19)
-			const T omega_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
-			const T omega_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
-			const T omega_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
+			const T omega_gam = - (mu_Cr * mu_Cr * gam_X_CrCr) / 2.
+			                    - (mu_Nb * mu_Nb * gam_X_NbNb) / 2.
+			                    - (mu_Cr * mu_Nb * gam_X_CrNb)
+			                    - mu_Cr * xe_Cr_gam
+			                    - mu_Nb * xe_Nb_gam;
+
+			const T omega_del = - (mu_Cr * mu_Cr * del_X_CrCr) / 2.
+			                    - (mu_Nb * mu_Nb * del_X_NbNb) / 2.
+			                    - (mu_Cr * mu_Nb * del_X_CrNb)
+			                    - mu_Cr * xe_Cr_del
+			                    - mu_Nb * xe_Nb_del;
+
+			const T omega_lav = - (mu_Cr * mu_Cr * lav_X_CrCr) / 2.
+			                    - (mu_Nb * mu_Nb * lav_X_NbNb) / 2.
+			                    - (mu_Cr * mu_Nb * lav_X_CrNb)
+			                    - mu_Cr * xe_Cr_lav
+			                    - mu_Nb * xe_Nb_lav;
 
 			// compute sources of chemical potential
 			const vector<T> lap_phi = ranged_laplacian(oldGrid, x, 2, 4);
@@ -274,12 +323,12 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			                            - W * fprime(phi_del)
 			                            - 2. * alpha * phi_del * phi_lav * phi_lav
 			                            - (omega_del - omega_gam) * gprime(phi_del)
-			                   );
+			                            );
 			const T dphidt_lav = Lmob * ( kappa * lap_phi[1]
 			                            - W * fprime(phi_lav)
 			                            - 2. * alpha * phi_lav * phi_del * phi_del
 			                            - (omega_lav - omega_gam) * gprime(phi_lav)
-			                   );
+			                            );
 
 			const T vphi = max(dphidt_del, dphidt_lav);
 
@@ -287,10 +336,20 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 				vphi_max = vphi;
 
 			// mu increment
-			const T dudt_A = lap_Cr[0] + lap_Cr[1] - (gprime(phi_del) * (del_xcr - gam_xcr) * dphidt_del - gprime(phi_lav) * (lav_xcr - gam_xcr) * dphidt_lav);
-			const T dudt_B = lap_Nb[0] + lap_Nb[1] - (gprime(phi_del) * (del_xnb - gam_xnb) * dphidt_del - gprime(phi_lav) * (lav_xnb - gam_xnb) * dphidt_lav);
+			const T dudt_A = lap_Cr[0] + lap_Cr[1]
+			               - ( gprime(phi_del) * (del_xcr - gam_xcr) * dphidt_del
+			                 + gprime(phi_lav) * (lav_xcr - gam_xcr) * dphidt_lav
+			                 );
+			const T dudt_B = lap_Nb[0] + lap_Nb[1]
+			               - ( gprime(phi_del) * (del_xnb - gam_xnb) * dphidt_del
+			                 + gprime(phi_lav) * (lav_xnb - gam_xnb) * dphidt_lav
+			                 );
+			/*
 			const T dudt_Cr = inv_X_CrCr * dudt_A + inv_X_CrNb * dudt_B;
 			const T dudt_Nb = inv_X_CrNb * dudt_A + inv_X_NbNb * dudt_B;
+			*/
+			const T dudt_Cr = inv_X_NbNb * dudt_A + inv_X_CrNb * dudt_B;
+			const T dudt_Nb = inv_X_CrNb * dudt_A + inv_X_CrCr * dudt_B;
 
 			// equations of motion
 			newGrid(n)[0] = mu_Cr + dt * dudt_Cr;
@@ -306,6 +365,8 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 
 		elapsed += dt;
 		double energy = 0.;
+		double comp_Cr = 0.;
+		double comp_Nb = 0.;
 
 		if (step % 100 == 0) {
 			#pragma omp parallel for
@@ -322,28 +383,62 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 				vector<T> grad_phi_del = gradient(oldGrid, x, 2);
 				vector<T> grad_phi_lav = gradient(oldGrid, x, 3);
 
-				const T omega_gam = - (mu_Cr * mu_Cr * gam_X_CrCr)/2. - (mu_Nb * mu_Nb * gam_X_NbNb) / 2. - (mu_Cr * mu_Nb * gam_X_CrNb) - mu_Cr * xe_Cr_gam - mu_Nb * xe_Nb_gam;
-				const T omega_del = - (mu_Cr * mu_Cr * del_X_CrCr)/2. - (mu_Nb * mu_Nb * del_X_NbNb) / 2. - (mu_Cr * mu_Nb * del_X_CrNb) - mu_Cr * xe_Cr_del - mu_Nb * xe_Nb_del;
-				const T omega_lav = - (mu_Cr * mu_Cr * lav_X_CrCr)/2. - (mu_Nb * mu_Nb * lav_X_NbNb) / 2. - (mu_Cr * mu_Nb * lav_X_CrNb) - mu_Cr * xe_Cr_lav - mu_Nb * xe_Nb_lav;
+				const T omega_gam = - (mu_Cr * mu_Cr * gam_X_CrCr) / 2.
+				                    - (mu_Nb * mu_Nb * gam_X_NbNb) / 2.
+				                    - (mu_Cr * mu_Nb * gam_X_CrNb)
+				                    - mu_Cr * xe_Cr_gam
+				                    - mu_Nb * xe_Nb_gam;
+
+				const T omega_del = - (mu_Cr * mu_Cr * del_X_CrCr) / 2.
+				                    - (mu_Nb * mu_Nb * del_X_NbNb) / 2.
+				                    - (mu_Cr * mu_Nb * del_X_CrNb)
+				                    - mu_Cr * xe_Cr_del
+				                    - mu_Nb * xe_Nb_del;
+
+				const T omega_lav = - (mu_Cr * mu_Cr * lav_X_CrCr) / 2.
+				                    - (mu_Nb * mu_Nb * lav_X_NbNb) / 2.
+				                    - (mu_Cr * mu_Nb * lav_X_CrNb)
+				                    - mu_Cr * xe_Cr_lav
+				                    - mu_Nb * xe_Nb_lav;
 
 				double myenergy = 0.;
-				myenergy += 0.5 * kappa * grad_phi_del * grad_phi_del + W * fdw(phi_del) + alpha * phi_del*phi_del * phi_lav*phi_lav;
-				myenergy += 0.5 * kappa * grad_phi_lav * grad_phi_lav + W * fdw(phi_lav) + alpha * phi_del*phi_del * phi_lav*phi_lav;
-				myenergy += g(phi_gam) * omega_gam + g(phi_del) * omega_del + g(phi_lav) * omega_lav;
+
+				myenergy += 0.5 * kappa * grad_phi_del * grad_phi_del
+				         + W * fdw(phi_del)
+				         + alpha * phi_del*phi_del * phi_lav*phi_lav;
+
+				myenergy += 0.5 * kappa * grad_phi_lav * grad_phi_lav
+				         + W * fdw(phi_lav)
+				         + alpha * phi_del*phi_del * phi_lav*phi_lav;
+				myenergy += g(phi_gam) * omega_gam
+				         + g(phi_del) * omega_del
+				         + g(phi_lav) * omega_lav;
 
 				myenergy *= dV;
 
 				#pragma omp atomic
 				energy += myenergy;
+
+				double x_Cr = oldGridN[10];
+				#pragma omp atomic
+				comp_Cr += x_Cr;
+
+				double x_Nb = oldGridN[11];
+				#pragma omp atomic
+				comp_Nb += x_Nb;
 			}
 
 			#ifdef MPI_VERSION
 			double myE(energy);
+			double myC(comp_Cr/Nt);
+			double myN(comp_Nb/Nt);
 			MPI::COMM_WORLD.Reduce(&myE, &energy, 1, MPI_DOUBLE, MPI_SUM, 0);
+			MPI::COMM_WORLD.Reduce(&myC, &comp_Cr, 1, MPI_DOUBLE, MPI_SUM, 0);
+			MPI::COMM_WORLD.Reduce(&myN, &comp_Nb, 1, MPI_DOUBLE, MPI_SUM, 0);
 			#endif
 
 			if (rank==0 && efile != NULL) {
-				fprintf(efile, "%e,%e,%e\n", elapsed, energy, vphi_max);
+				fprintf(efile, "%e,%e,%e,%e,%e\n", elapsed, comp_Cr, comp_Nb, energy, vphi_max);
 				fflush(efile);
 			}
 		}

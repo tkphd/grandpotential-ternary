@@ -4,7 +4,7 @@ CFLAGS = -O3 -Wall -pedantic -I$(MMSP_PATH)/include -std=c++11
 LINKS = -fopenmp -lm -lz
 
 run: PFGP
-	./PFGP --example 2 data/test.dat && ./PFGP data/test.dat 50000000 100000
+	./PFGP --example 2 data/test.dat && ./PFGP data/test.dat 100000 1000
 .PHONY: run
 
 PFGP: phaseFieldGP.cpp phaseFieldGP.hpp
